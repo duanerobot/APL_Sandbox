@@ -36,7 +36,7 @@ Right-click the canvas to add nodes.
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/apl-sandbox
+git clone https://github.com/duanerobot/apl-sandbox
 cd apl-sandbox
 python3 server.py
 ```
