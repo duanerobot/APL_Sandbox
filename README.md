@@ -1,3 +1,5 @@
+![APL Sandbox](APL_Sandbox_Simple.png)
+
 # APL Sandbox
 
 A visual node-based environment for learning and exploring Dyalog APL.
