@@ -1,5 +1,352 @@
 #!/usr/bin/env python3
 """
+APL_Sandbox Server — bridges litegraph frontend to Dyalog APL and Rhino 3D.
+Usage: python3 server.py   →  http://localhost:5000
+"""
+
+import json
+import os
+import shutil
+import socket
+import subprocess
+import tempfile
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# ── Config ───────────────────────────────────────────────────────────────────
+SERVER_PORT = 5000
+RHINO_HOST  = 'localhost'
+RHINO_PORT  = 6789
+DYALOG_PATH = None   # None = auto-detect
+
+def find_dyalog():
+    if DYALOG_PATH:
+        return DYALOG_PATH
+    for c in [
+        shutil.which('dyalogscript'),
+        '/usr/bin/dyalogscript',
+        '/opt/mdyalog/20.0/64/unicode/dyalogscript',
+        '/opt/mdyalog/19.0/64/unicode/dyalogscript',
+    ]:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+DYALOG     = find_dyalog()
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+# ── APL evaluation ────────────────────────────────────────────────────────────
+def evaluate_apl(script):
+    """Run an APL script via dyalogscript, return (stdout, stderr).
+    Returns (None, error_string) on hard failures."""
+    if not DYALOG:
+        return None, 'dyalogscript not found — set DYALOG_PATH in server.py'
+    tmppath = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.apl', delete=False, encoding='utf-8'
+        ) as f:
+            f.write(script)
+            tmppath = f.name
+        proc = subprocess.run(
+            [DYALOG, tmppath],          # use detected path, not bare 'dyalogscript'
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        return None, 'APL evaluation timed out (30 s)'
+    except Exception as e:
+        return None, str(e)
+    finally:
+        if tmppath:
+            try: os.unlink(tmppath)
+            except OSError: pass
+
+
+# ── Graph execution ───────────────────────────────────────────────────────────
+def execute_graph(graph_data, boxing=False):
+    """
+    Compile a serialised litegraph graph to an APL script, evaluate it,
+    and return per-node results so every node can show its value.
+
+    litegraph link tuple: [id, src_node, src_slot, dst_node, dst_slot, type]
+    APL/Function input slots:  0 = ⍵  (right arg),  1 = ⍺  (left arg)
+    """
+    nodes     = {n['id']: n for n in graph_data.get('nodes', [])}
+    links_raw = graph_data.get('links', [])
+
+    # (dst_node_id, dst_slot) → (src_node_id, src_slot)
+    input_map = {}
+    for lnk in links_raw:
+        if len(lnk) >= 5:
+            _, src_n, src_s, dst_n, dst_s = lnk[:5]
+            input_map[(dst_n, dst_s)] = (src_n, src_s)
+
+    sorted_nodes = sorted(nodes.values(), key=lambda n: n.get('order', 0))
+
+    # ── Script preamble ───────────────────────────────────────────────────
+    lines = ['⎕PP←10', '⎕PW←200', '']
+
+    if boxing:
+        # Pure-APL boxer. ⍕⍵ returns a char VECTOR for scalars/vectors but
+        # a char MATRIX for higher-rank arrays; normalise to matrix then wrap.
+        lines += [
+            '_box←{',
+            '    m←{2=⍴⍴⍵:⍵ ⋄ (1,⍴⍵)⍴⍵}⍕⍵  ⍝ ensure rank-2 char matrix',
+            '    r c←⍴m',
+            "    h←(1,c+2)⍴'+',(c⍴'-'),'+'",
+            "    s←(r,1)⍴'|'",
+            '    h⍪(s,m,s)⍪h',
+            '}',
+            '⍝ Try ⎕SE.Dyalog.Utils.display; fall back to _box',
+            ':Trap 0',
+            '    _disp←⎕SE.Dyalog.Utils.display',
+            ':Else',
+            '    _disp←_box',
+            ':EndTrap',
+            '',
+        ]
+
+    out_vars = {}   # (node_id, out_slot) → apl_var_name
+
+    def input_var(nid, slot):
+        src = input_map.get((nid, slot))
+        return out_vars.get(src) if src else None
+
+    def emit_result(nid, var):
+        """Output <<<NODE_nid>>> … <<<END_nid>>> markers for the JS to parse."""
+        lines.append(f"⎕←'<<<NODE_{nid}>>>'")
+        if boxing:
+            lines.append(f':Trap 0')
+            lines.append(f"    ⎕←_disp {var}")
+            lines.append(f':Else')
+            lines.append(f"    ⎕←'[display error: ',⎕DMX.EM,']'")
+            lines.append(f"    ⎕←{var}")
+            lines.append(f':EndTrap')
+        else:
+            lines.append(f"⎕←{var}")
+        lines.append(f"⎕←'<<<END_{nid}>>>'")
+
+    rhino_node_ids = []
+
+    for node in sorted_nodes:
+        nid   = node['id']
+        ntype = node['type']
+        props = node.get('properties', {})
+
+        # ── APL/Input ─────────────────────────────────────────────────────
+        if ntype == 'APL/Input':
+            data = (props.get('data', '⍬') or '⍬').strip()
+            var  = f'_v{nid}'
+            lines.append(f':Trap 0')
+            lines.append(f'    {var}←{data}')
+            lines.append(f':Else')
+            # ⎕DMX.EM is the error name (e.g. "SYNTAX ERROR"); always non-empty
+            lines.append(f"    {var}←'ERROR: ',⎕DMX.EM,': ',⎕DMX.Message")
+            lines.append(f':EndTrap')
+            out_vars[(nid, 0)] = var
+            emit_result(nid, var)
+
+        # ── APL/Function ──────────────────────────────────────────────────
+        elif ntype == 'APL/Function':
+            expr  = (props.get('expr', '⊢') or '⊢').strip()
+            omega = input_var(nid, 0)
+            alpha = input_var(nid, 1)
+            var   = f'_v{nid}'
+            lines.append(f':Trap 0')
+            if omega and alpha:
+                lines.append(f'    {var}←({alpha})({expr})({omega})')
+            elif omega:
+                lines.append(f'    {var}←({expr})({omega})')
+            else:
+                lines.append(f"    {var}←'ERROR: ⍵ not connected'")
+            lines.append(f':Else')
+            lines.append(f"    {var}←'ERROR: ',⎕DMX.EM,': ',⎕DMX.Message")
+            lines.append(f':EndTrap')
+            out_vars[(nid, 0)] = var
+            emit_result(nid, var)
+
+        # ── APL/Panel ─────────────────────────────────────────────────────
+        elif ntype == 'APL/Panel':
+            src = input_var(nid, 0)
+            var = f'_v{nid}'
+            if src:
+                lines.append(f'{var}←{src}')
+            else:
+                lines.append(f"{var}←'─── nothing connected ───'")
+            out_vars[(nid, 0)] = var
+            emit_result(nid, var)
+
+        # ── APL/Rhino/Point ───────────────────────────────────────────────
+        elif ntype == 'APL/Rhino/Point':
+            src = input_var(nid, 0)
+            var = f'_v{nid}'
+            if src:
+                lines.append(f'{var}←{src}')
+                lines.append(f"⎕←'<<<RHINO_POINT_{nid}>>>'")
+                lines.append(f"⎕←{var}")
+                lines.append(f"⎕←'<<<END_{nid}>>>'")
+                out_vars[(nid, 0)] = var
+            rhino_node_ids.append(nid)
+
+    lines.extend(['', ')off'])
+    script = '\n'.join(lines)
+
+    stdout, stderr = evaluate_apl(script)
+    if stdout is None:
+        return {'error': stderr, 'nodes': {}, 'script': script}
+
+    # ── Parse stdout ──────────────────────────────────────────────────────────
+    results = {
+        'nodes':        {},      # node_id (str) → result text
+        'rhino_points': [],
+        'script':       script,
+        'stderr':       stderr,
+    }
+    current = None   # active node id string
+    ctype   = None   # 'node' | 'rhino'
+    cbuf    = []
+
+    for raw_line in stdout.split('\n'):
+        line = raw_line.rstrip()
+
+        # Suppress bare APL prompts (six leading spaces)
+        if line == '      ':
+            continue
+
+        if line.startswith('<<<NODE_') and line.endswith('>>>'):
+            current = line[8:-3]
+            ctype   = 'node'
+            cbuf    = []
+
+        elif line.startswith('<<<RHINO_POINT_') and line.endswith('>>>'):
+            current = line[15:-3]
+            ctype   = 'rhino'
+            cbuf    = []
+
+        elif current is not None and line == f'<<<END_{current}>>>':
+            text = '\n'.join(cbuf).strip()
+            if ctype == 'node':
+                results['nodes'][current] = text
+            elif ctype == 'rhino':
+                try:
+                    nums = [float(x) for x in text.split()]
+                    if len(nums) >= 3:
+                        coords = [[nums[i], nums[i+1], nums[i+2]]
+                                  for i in range(0, len(nums) - 2, 3)]
+                        if len(coords) == 1:
+                            results['rhino_points'].append({
+                                'type': 'point',
+                                'x': coords[0][0], 'y': coords[0][1], 'z': coords[0][2],
+                            })
+                        else:
+                            results['rhino_points'].append(
+                                {'type': 'points', 'coords': coords}
+                            )
+                except Exception:
+                    pass
+            current = None
+            cbuf    = []
+
+        elif current is not None:
+            cbuf.append(line)
+
+    # ── Send geometry to Rhino ────────────────────────────────────────────────
+    for pt in results['rhino_points']:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2)
+            s.connect((RHINO_HOST, RHINO_PORT))
+            s.send(json.dumps(pt).encode())
+            s.close()
+        except Exception:
+            pass
+
+    return results
+
+
+# ── HTTP handler ──────────────────────────────────────────────────────────────
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def _cors(self):
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self._cors()
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path in ('/', '/index.html'):
+            path = os.path.join(SCRIPT_DIR, 'index.html')
+            try:
+                with open(path, 'rb') as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self._cors()
+                self.end_headers()
+                self.wfile.write(data)
+            except FileNotFoundError:
+                self.send_response(404)
+                self.end_headers()
+
+        elif self.path == '/status':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self._cors()
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                'dyalog': DYALOG or 'not found',
+                'rhino':  f'{RHINO_HOST}:{RHINO_PORT}',
+            }).encode())
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        length = int(self.headers.get('Content-Length', 0))
+        try:
+            body = json.loads(self.rfile.read(length))
+        except Exception:
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        if self.path == '/execute':
+            boxing = body.pop('boxing', False)
+            result  = execute_graph(body, boxing=boxing)
+            payload = json.dumps(result).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self._cors()
+            self.end_headers()
+            self.wfile.write(payload)
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    print('APL_Sandbox')
+    if DYALOG:
+        print(f'  Dyalog  : {DYALOG}')
+    else:
+        print('  Dyalog  : NOT FOUND — set DYALOG_PATH at top of server.py')
+    print(f'  Rhino   : tcp://{RHINO_HOST}:{RHINO_PORT}')
+    print(f'  Open    : http://localhost:{SERVER_PORT}')
+    HTTPServer(('localhost', SERVER_PORT), Handler).serve_forever()
+#!/usr/bin/env python3
+"""
 APL Sandbox Server
 Bridges the litegraph frontend to Dyalog APL and Rhino 3D.
 Usage: python3 server.py
